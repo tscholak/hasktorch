@@ -6,7 +6,7 @@ let
           owner  = "stites";
           repo   = "pytorch-world";
           rev    = "fcef3543f570e87ea1257701bfa9df1ad1145983";
-          sha256 = "13620p2z5pv3znhb80jbr1bsa164fh09wxvgfj35vvxcsqnirvqs";
+          sha256 = "1rq3ich00njp527b821r0nny2afggc3sd4bhi9m7ps7hkl8qcv0f";
     };
     in (pkgs.callPackage "${src}/libtorch/release.nix" { });
 
