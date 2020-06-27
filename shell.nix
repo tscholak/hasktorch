@@ -14,6 +14,8 @@
 }:
 with pkgs;
 let
+  sources = import ./nix/sources.nix { inherit pkgs; }
+    // sourcesOverride;
   # This provides a development environment that can be used with nix-shell or
   # lorri. See https://input-output-hk.github.io/haskell.nix/user-guide/development/
   shell = hasktorchHaskellPackages.shellFor {
@@ -71,4 +73,4 @@ let
 
 in
 
- shell // { inherit devops; }
+  shell // { inherit devops; }
