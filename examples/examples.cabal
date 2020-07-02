@@ -16,9 +16,6 @@ common config
   ghc-options:         -fplugin GHC.TypeLits.Normalise -fplugin GHC.TypeLits.KnownNat.Solver -fplugin GHC.TypeLits.Extra.Solver -fconstraint-solver-iterations=0 -rtsopts
   build-depends:       base >= 4.7 && < 5
                      , hasktorch
-                    --  , ghc-typelits-extra >= 0.3.1
-                    --  , ghc-typelits-knownnat >= 0.7
-                    --  , ghc-typelits-natnormalise >= 0.7
                      , ghc-typelits-extra
                      , ghc-typelits-knownnat
                      , ghc-typelits-natnormalise
@@ -33,10 +30,8 @@ executable static-xor-mlp
   import:              config
   hs-source-dirs:      static-xor-mlp
   main-is:             Main.hs
-  build-depends:       base >= 4.7 && < 5
-                     , hasktorch
-                     , mtl
-                     , reflection
+  build-depends:       reflection
+                     , libtorch-ffi
 
 library static-mnist
   import:              config

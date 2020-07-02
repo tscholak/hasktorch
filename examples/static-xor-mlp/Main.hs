@@ -27,8 +27,11 @@ import           Control.Monad                  ( foldM
 import           GHC.Generics
 import           GHC.TypeLits
 
-import Torch.Typed hiding (Device)
+import Torch.Typed
 import           Torch.Data.Pipeline
+import Torch (ATenTensor)
+import Torch.Internal.Class (Castable)
+import Control.Monad.IO.Class (MonadIO)
 
 
 --------------------------------------------------------------------------------
@@ -82,37 +85,73 @@ newtype Xor = Xor { iters :: Int }
 
 instance ( KnownNat batchSize
          , KnownDevice device
-         , RandDTypeIsValid device 'Float
-         , ComparisonDTypeIsValid device 'Float
-         ) => Dataset IO Xor (Tensor device 'Float '[batchSize, 2]) where
-  getBatch _ _ =  toDType @'Float @'Bool .
-                  gt (toDevice @device (0.5 :: CPUTensor 'Float '[]))
-                  <$> rand @'[batchSize, 2] @'Float @device
-  numIters = iters 
+         , KnownDType dtype
+         , RandDTypeIsValid device dtype
+         , ComparisonDTypeIsValid device dtype
+         ) => Dataset IO Xor (Tensor device dtype '[batchSize, 2]) where
+  getBatch _ _ =  toDType @dtype @'Bool .
+                  gt (toDevice @device (0.5 :: CPUTensor dtype '[]))
+                  <$> rand @'[batchSize, 2] @dtype @device
+  numIters = iters
 
-type Device = '( 'CUDA, 0)
+-- this should be part of hasktorch, maybe in a new Torch.Typed.Trainer module
+-- there needs to be another one for the untyped API in Torch.Trainer
+class
+  ( 'Just device ~ GetDevice model
+  , 'Just device ~ GetDevice batch
+  , 'Just dtype ~ GetDType model
+  , 'Just dtype ~ GetDType batch
+  ) => HasTrainingStep model batch device dtype where
+  trainingStep :: model -> (batch, Int) -> Loss device dtype
 
-trainIter :: forall device batchSize model optim . (model ~ MLP 2 1 4 'Float device, _)
-  => LearningRate device 'Float
-  -> (model, optim, Int)
-  -> Tensor device 'Float '[batchSize, 2]
-  -> IO (model, optim, Int)
-trainIter learningRate (model,optim, i) input = do
-    let actualOutput   = squeezeAll . ((sigmoid .) . forward) model $ input
-        expectedOutput = xor input
-        loss           = mseLoss @ReduceMean actualOutput expectedOutput
+-- this is similar to torch lightning's training_step
+instance
+  ( StandardFloatingPointDTypeValidation device dtype
+  , SqueezeAll '[batchSize, 1] ~ '[batchSize]
+  , KnownDevice device
+  ) => HasTrainingStep (MLP 2 1 4 dtype device) (Tensor device dtype '[batchSize, 2]) device dtype where
+  trainingStep model (batch, iter) = 
+    let actualOutput   = squeezeAll . ((sigmoid .) . forward) model $ batch
+        expectedOutput = xor batch
+    in  mseLoss @ReduceMean actualOutput expectedOutput
 
-    when (i `mod` 2500 == 0) (print loss)
+-- this or similar should be a library function
+train
+  :: forall batch model optim device dtype dataset parameters gradients tensors
+   . ( Dataset IO dataset batch
+     , HasTrainingStep model batch device dtype
+     , Parameterized model parameters
+     , HasGrad (HList parameters) (HList gradients)
+     , tensors ~ gradients
+     , HMap' ToDependent parameters tensors
+     , Castable (HList gradients) [ATenTensor]
+     , Optimizer optim gradients tensors dtype device
+     , HMapM' IO MakeIndependent tensors parameters
+     )
+  => LearningRate device dtype
+  -> dataset
+  -> model
+  -> optim
+  -> IO (model, optim)
+train learningRate dataset model optim = do
+  fold <- makeFold dataset
+  fold $ FoldM
+    ( \(model, optim) (batch, iter) -> do
+        let loss = trainingStep @model @batch model (batch, iter)
+        when (iter `mod` 2500 == 0) (print loss)
+        runStep model optim loss learningRate
+    )
+    (pure (model, optim))
+    pure
 
-    (model', optim') <- runStep model optim loss learningRate
-    return (model', optim', i+1)
+type Device_ = '( 'CPU, 0)
+type DType_ = 'Float
 
 main :: IO ()
 main = do
   let numIters = 100000
       learningRate = 0.1
-  initModel <- sample (MLPSpec :: MLPSpec 2 1 4 'Float Device)
-  let initOptim = mkAdam 0 0.9 0.999 (flattenParameters initModel)
-  trainFold <- makeFold $ Xor { iters = numIters }
-  (trained, _, _) <- trainFold $ FoldM (trainIter @Device @256 learningRate ) (pure (initModel, initOptim, 0)) pure
-  print trained
+  model <- sample (MLPSpec :: MLPSpec 2 1 4 DType_ Device_)
+  let optim = mkAdam 0 0.9 0.999 (flattenParameters model)
+  (model', _) <- train @(Tensor Device_ DType_ '[256, 2]) learningRate (Xor { iters = numIters }) model optim
+  print model'

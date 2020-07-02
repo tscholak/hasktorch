@@ -57,45 +57,43 @@ takeBatch input = fromInput input >-> P.takeWhile isJust >-> yieldMore
   where yieldMore = forever $ await >>= \case
           Just batch -> yield batch
           Nothing -> return ()
+
 readBatches'
   :: MonadIO m
   => Int
-  -> (Int -> Producer (Maybe a) m a)
-  -> Output (Maybe a)
+  -> (Int -> m a)
+  -> Output (Maybe (a, Int))
   -> Effect m ()
 readBatches' numIters getBatch outputBox = 
-
   for (each [1..numIters]) (\iter -> yieldBatch iter >-> toOutput outputBox)
-    where yieldBatch iter =
-             runBatch iter >>= yield
-          runBatch iter = if numIters == iter then pure Nothing else Just <$> getBatch iter
+    where yieldBatch iter = (lift . runBatch) iter >>= yield
+          runBatch iter = if numIters == iter then pure Nothing else (\batch -> Just (batch, iter)) <$> getBatch iter
 
 readBatchesConcurrently :: forall dataset batch m .
-  (ConcurrentDataset m dataset batch) => Int -> dataset -> Output (Maybe batch)  -> Effect m () 
+  (ConcurrentDataset m dataset batch) => Int -> dataset -> Output (Maybe (batch, Int))  -> Effect m () 
 readBatchesConcurrently workerId dataset outputBox = 
-  readBatches' (numIters @m @dataset @batch dataset + 1) (lift . getBatchConcurrently workerId dataset) outputBox
+  readBatches' (numIters @m @dataset @batch dataset + 1) (getBatchConcurrently workerId dataset) outputBox
 
 readBatches :: forall dataset batch m.
-  (Dataset m dataset batch) => dataset -> Output (Maybe batch)  -> Effect m () 
-readBatches dataset outputBox = readBatches' (numIters @m @dataset @batch dataset + 1) (lift . getBatch dataset) outputBox
+  (Dataset m dataset batch) => dataset -> Output (Maybe (batch, Int))  -> Effect m () 
+readBatches dataset outputBox = readBatches' (numIters @m @dataset @batch dataset + 1) (getBatch dataset) outputBox
 
-runTransforms :: MonadIO m => (batch -> batch') -> Input (Maybe batch) -> Output (Maybe batch') -> Effect m ()
-runTransforms transforms transformBox trainBox = fromInput transformBox >->  P.map (fmap transforms) >-> toOutput trainBox
+runTransforms :: MonadIO m => (batch -> batch') -> Input (Maybe (batch, Int)) -> Output (Maybe (batch', Int)) -> Effect m ()
+runTransforms transforms transformBox trainBox = fromInput transformBox >-> P.map (fmap (\(batch, iter) -> (transforms batch, iter))) >-> toOutput trainBox
 
 makeFold' :: (Dataset m2 dataset batch, MonadIO m, MonadIO m2)
     => dataset
-    -> m2 (L.FoldM m batch b -> m b, Async (StM m2 ()))
+    -> m2 (L.FoldM m (batch, Int) b -> m b, Async (StM m2 ()))
 makeFold' dataset = do
   (toBatches, fromBatches, sealBatch) <- liftIO $ spawn' (bounded 1)
   batchThread <- async $ void $ runEffect $ readBatches dataset toBatches
   pure (foldFromProducer (takeBatch fromBatches), batchThread)
 
-
 makeConcurrentFold' :: (MonadIO m2, ConcurrentDataset m2 dataset batch', MonadIO m)
   => (batch' -> batch)
   -> dataset
   -> Int
-  -> m2 (L.FoldM m batch b -> m b, [Async (StM m2 ())])
+  -> m2 (L.FoldM m (batch, Int) b -> m b, [Async (StM m2 ())])
 makeConcurrentFold' transforms dataset numWorkers = do
   -- Buffer size is equal to numWorkers so that each thread can yield a batch.
   -- This is not actually the enforced behaviour, one thread may fill the buffer with multiple batches,
@@ -106,11 +104,10 @@ makeConcurrentFold' transforms dataset numWorkers = do
   async $ runEffect $ runTransforms transforms fromTransformBox toBatches
   pure  $ (foldFromProducer (takeBatch fromBatches), batchThreads)
 
-  
 makeFoldWithTransform' :: (MonadIO m, MonadIO m2, Dataset m2 dataset batch)  
   => (batch -> batch')
   -> dataset
-  -> m2 (L.FoldM m batch' b -> m b, Async (StM m2 ()))
+  -> m2 (L.FoldM m (batch', Int) b -> m b, Async (StM m2 ()))
 makeFoldWithTransform' transforms dataset = do
           -- TODO: we can allow different buffer sizes
           -- which would be necessary for data echoing
@@ -122,21 +119,21 @@ makeFoldWithTransform' transforms dataset = do
 
 makeFold :: (Dataset m2 dataset batch, MonadIO m, MonadIO m2)
     => dataset
-    -> m2 (L.FoldM m batch b -> m b)
+    -> m2 (L.FoldM m (batch, Int) b -> m b)
 makeFold = fmap fst . makeFold' 
 
 makeFoldWithTransform :: (MonadIO m, MonadIO m2, Dataset m2 dataset batch)  
   => (batch -> batch')
   -> dataset
-  -> m2 (L.FoldM m batch' b -> m b)
+  -> m2 (L.FoldM m (batch', Int) b -> m b)
 makeFoldWithTransform transf = fmap fst . makeFoldWithTransform' transf 
 
 makeConcurrentFold :: (MonadIO m2, MonadIO m, ConcurrentDataset m2 dataset batch')
   => (batch' -> batch)
   -> dataset
   -> Int
-  -> m2 (L.FoldM m batch b -> m b)
+  -> m2 (L.FoldM m (batch, Int) b -> m b)
 makeConcurrentFold transforms dataset = fmap fst . makeConcurrentFold' transforms dataset
   
-foldFromProducer :: Monad m => Producer batch m () -> L.FoldM m batch b -> m b
+foldFromProducer :: Monad m => Producer a m () -> L.FoldM m a b -> m b
 foldFromProducer prod fold = (L.impurely P.foldM) fold prod
