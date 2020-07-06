@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -35,8 +36,86 @@ import           Pipes
 import           Pipes.Concurrent
 import qualified Pipes.Prelude as P
 
-import           Control.Monad.Trans.Control (MonadBaseControl(..))
+import           Control.Monad.Base              (MonadBase, liftBase)
+import           Control.Monad.Trans.Control (control, MonadBaseControl(..))
+import Control.Monad.Trans.Free (wrap, iterT, FreeF(..), runFreeT, FreeT(..))
+import Control.Exception (finally, bracket)
 
+
+foo :: (Monad m) => FreeT ((,) a) m r -> Producer a m r
+foo f = do
+  x <- lift (runFreeT f)
+  case x of
+    Pure r -> pure r
+    Free (a, f') -> yield a >> foo f'
+
+bar :: (Monad m) => Producer a m r -> FreeT ((,) a) m r
+bar p = do 
+  x <- lift (next p)
+  case x of
+    Left r -> pure r
+    Right (a, p') -> wrap (a, bar p')
+
+baz
+  :: forall m a b r
+   . (MonadBaseControl IO m, MonadBase IO m)
+  => Buffer b -- buffer
+  -> (a -> ListT m b) -- create a dataset by seeding it with an `a`
+  -> ListT m a -- an effectful iteration of `a`s
+  -> m (ListT m b)
+baz buffer f p =
+  let l output = let step = flip $ mappend . Concurrently . runEffect . (>-> toOutput' output) . enumerate . f
+                 in  join . P.fold step mempty runConcurrently $ enumerate p
+      r = pure . fromInput'
+  in  Select . snd <$> withBuffer' buffer l r
+
+withBuffer'
+    :: (MonadBaseControl IO m, MonadBase IO m)
+    => Buffer a
+    -> (Output a -> m l)
+    -> (Input  a -> m r)
+    -> m (l, r)
+withBuffer' buffer fOutput fInput = liftedBracket
+  (liftBase $ spawn' buffer)
+  (\(_, _, seal) -> liftBase $ atomically seal)
+  (\(output, input, seal) ->
+    concurrently
+      (fOutput output `liftedFinally` (liftBase $ atomically seal))
+      (fInput  input  `liftedFinally` (liftBase $ atomically seal))
+  )
+
+fromInput' :: (MonadBase IO m) => Input a -> Producer' a m ()
+fromInput' input = loop
+  where
+    loop = do
+        ma <- liftBase $ atomically $ recv input
+        case ma of
+            Nothing -> return ()
+            Just a  -> do
+                yield a
+                loop
+
+toOutput' :: (MonadBase IO m) => Output a -> Consumer' a m ()
+toOutput' output = loop
+  where
+    loop = do
+        a     <- await
+        alive <- liftBase $ atomically $ send output a
+        when alive loop
+
+liftedBracket :: MonadBaseControl IO m => m a -> (a -> m b) -> (a -> m c) -> m c
+liftedBracket acquire release action = control $ \runInIO ->
+    bracket (runInIO acquire)
+            (\saved -> runInIO (restoreM saved >>= release))
+            (\saved -> runInIO (restoreM saved >>= action))
+
+liftedFinally :: MonadBaseControl IO m => m a -> m b -> m a
+liftedFinally a sequel = control $ \runInIO ->
+                           finally (runInIO a)
+                                   (runInIO sequel)
+
+instance (MonadBase IO m) => MonadBase IO (Proxy a' a b' b m) where
+  liftBase = lift . liftBase
 
 type Iter = Int
 type WorkerId = Int
@@ -53,7 +132,7 @@ class Dataset m dataset batch => ConcurrentDataset m dataset batch where
   getBatchConcurrently :: WorkerId -> dataset -> Iter -> m batch
 
 takeBatch :: MonadIO m => Input (Maybe batch) -> Producer batch m ()  
-takeBatch input = fromInput input >-> P.takeWhile isJust >-> yieldMore
+takeBatch input = fromInput input >-> yieldMore
   where yieldMore = forever $ await >>= \case
           Just batch -> yield batch
           Nothing -> return ()
